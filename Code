@@ -1,0 +1,493 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+/* ── CONSTANTS ─────────────────────────────────────────────────── */
+const SOURCES = [
+  { id: "feedly",        label: "Feedly",         icon: "📡", color: "#00d4ff" },
+  { id: "cisa_adv",     label: "CISA Advisory",  icon: "🛡️", color: "#ff6b35" },
+  { id: "cisa_alt",     label: "CISA Alerts",    icon: "🚨", color: "#ff2d55" },
+  { id: "mitre_attack", label: "MITRE ATT&CK",   icon: "⚔️", color: "#bf5fff" },
+  { id: "mitre_atlas",  label: "MITRE ATLAS",    icon: "🧠", color: "#5fb8ff" },
+  { id: "hackernews",   label: "Hacker News",    icon: "💻", color: "#ff9f1c" },
+  { id: "darkreading",  label: "Dark Reading",   icon: "🌑", color: "#aaaaaa" },
+];
+
+const FOCUS = [
+  { id: "dc",   label: "Data Center",  short: "DC",  icon: "🖥️" },
+  { id: "ot",   label: "OT / ICS",     short: "OT",  icon: "⚙️" },
+  { id: "both", label: "DC + OT",      short: "ALL", icon: "🔗" },
+];
+
+const QUICK = [
+  { label: "CISA Advisories",      q: "Latest CISA ICS and data center security advisories this week. Include CVEs and severity." },
+  { label: "OT Threat Landscape",  q: "Most recent OT/ICS threats targeting industrial control systems. Pull from CISA, MITRE ATT&CK, Dark Reading." },
+  { label: "DC Workload CVEs",     q: "Critical CVEs for data center workloads this week — hypervisors, containers, Kubernetes, VMware." },
+  { label: "ATT&CK ICS TTPs",     q: "Latest MITRE ATT&CK for ICS actively exploited techniques. Include technique IDs and threat actors." },
+  { label: "AI/ML Attack Vectors", q: "MITRE ATLAS adversarial AI attacks targeting data center ML workloads and AI inference." },
+  { label: "Ransomware Campaigns", q: "Latest ransomware targeting data centers and OT critical infrastructure. CISA + Dark Reading + HN." },
+];
+
+const SYSTEM_PROMPT = `You are DCOT Bot — an elite cybersecurity intelligence analyst for:
+1. Data Center Workloads Security (hypervisors, containers, storage nets, east-west threats, bare-metal)
+2. Operational Technology (OT/ICS/SCADA, PLCs, HMIs, Modbus/DNP3/EtherNet-IP, Purdue model)
+
+Sources: Feedly, CISA Advisory, CISA Alerts, MITRE ATT&CK, MITRE ATLAS, Hacker News, Dark Reading.
+
+Rules:
+- Search the web for LATEST threat intel, CVEs, advisories, TTPs
+- Tag: [CISA] [MITRE ATT&CK] [MITRE ATLAS] [Dark Reading] [HN] [Feedly]
+- Severity: 🔴 CRITICAL | 🟠 HIGH | 🟡 MEDIUM | 🟢 LOW
+- Structure: Threat Summary → Affected Systems → TTPs (with technique IDs) → Mitigations → References
+- Flag relevance: Data Centers / OT / Both
+- Today: ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}`;
+
+/* ── TINY HELPERS ───────────────────────────────────────────────── */
+const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
+
+function useInterval(fn, ms) {
+  const cb = useRef(fn);
+  useEffect(() => { cb.current = fn; }, [fn]);
+  useEffect(() => { const id = setInterval(() => cb.current(), ms); return () => clearInterval(id); }, [ms]);
+}
+
+/* ── RADAR CANVAS ───────────────────────────────────────────────── */
+function Radar() {
+  const ref = useRef();
+  const angle = useRef(0);
+  const blips = useRef(Array.from({length:6},()=>({ r: Math.random()*.85+.1, a: Math.random()*Math.PI*2, life:1})));
+
+  useEffect(() => {
+    const cv = ref.current; if(!cv) return;
+    const ctx = cv.getContext("2d");
+    let raf;
+    const draw = () => {
+      const W = cv.width, H = cv.height, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 4;
+      ctx.clearRect(0,0,W,H);
+      // rings
+      ctx.strokeStyle = "rgba(0,212,255,0.12)";
+      ctx.lineWidth = 1;
+      [.25,.5,.75,1].forEach(f => { ctx.beginPath(); ctx.arc(cx,cy,R*f,0,Math.PI*2); ctx.stroke(); });
+      // crosshairs
+      ctx.strokeStyle = "rgba(0,212,255,0.08)";
+      [[cx,cy-R,cx,cy+R],[cx-R,cy,cx+R,cy]].forEach(([x1,y1,x2,y2])=>{
+        ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      });
+      // sweep
+      angle.current = (angle.current + 0.012) % (Math.PI*2);
+      const sweep = ctx.createConicalGradient ? null : null;
+      const grad = ctx.createConicGradient ? ctx.createConicGradient(angle.current - 1.2, cx, cy) : null;
+      if(grad){
+        grad.addColorStop(0,"rgba(0,212,255,0)");
+        grad.addColorStop(1,"rgba(0,212,255,0.18)");
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.fill();
+      }
+      // sweep line fallback
+      ctx.strokeStyle = "rgba(0,212,255,0.6)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(cx,cy);
+      ctx.lineTo(cx + Math.cos(angle.current)*R, cy + Math.sin(angle.current)*R);
+      ctx.stroke();
+      // blips
+      blips.current.forEach((b,i) => {
+        const da = ((b.a - angle.current) % (Math.PI*2) + Math.PI*2) % (Math.PI*2);
+        b.life = da < 0.15 ? 1 : Math.max(0, b.life - 0.008);
+        if(b.life < 0.02) blips.current[i] = {r:Math.random()*.8+.1,a:Math.random()*Math.PI*2,life:0};
+        const bx = cx + Math.cos(b.a)*R*b.r, by = cy + Math.sin(b.a)*R*b.r;
+        ctx.beginPath(); ctx.arc(bx,by,3,0,Math.PI*2);
+        ctx.fillStyle = `rgba(255,${b.r>.6?50:200},${b.r>.6?50:100},${b.life})`;
+        ctx.fill();
+        if(b.life>.5){ ctx.beginPath(); ctx.arc(bx,by,6,0,Math.PI*2); ctx.strokeStyle=`rgba(255,80,80,${b.life*.4})`; ctx.lineWidth=1; ctx.stroke(); }
+      });
+      raf = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => cancelAnimationFrame(raf);
+  },[]);
+
+  return <canvas ref={ref} width={140} height={140} style={{borderRadius:"50%",display:"block"}} />;
+}
+
+/* ── MATRIX RAIN (mini) ─────────────────────────────────────────── */
+function MatrixStrip() {
+  const ref = useRef();
+  useEffect(()=>{
+    const cv=ref.current; if(!cv) return;
+    const ctx=cv.getContext("2d");
+    const W=cv.width,H=cv.height,cols=Math.floor(W/10);
+    const drops=Array(cols).fill(0);
+    let raf;
+    const draw=()=>{
+      ctx.fillStyle="rgba(2,12,24,0.2)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle="rgba(0,212,255,0.5)";
+      ctx.font="9px 'Courier New'";
+      drops.forEach((y,i)=>{
+        const char=String.fromCharCode(0x30A0+Math.random()*96);
+        ctx.fillText(char,i*10,y*10);
+        if(y*10>H&&Math.random()>0.975) drops[i]=0;
+        drops[i]++;
+      });
+      raf=requestAnimationFrame(draw);
+    };
+    draw();
+    return ()=>cancelAnimationFrame(raf);
+  },[]);
+  return <canvas ref={ref} width={200} height={60} style={{opacity:.4,display:"block"}} />;
+}
+
+/* ── THREAT METER ───────────────────────────────────────────────── */
+function ThreatMeter({level}){
+  const levels=[
+    {label:"LOW",color:"#00ff88",pct:20},
+    {label:"MEDIUM",color:"#ffcc00",pct:45},
+    {label:"HIGH",color:"#ff6b35",pct:70},
+    {label:"CRITICAL",color:"#ff2d55",pct:95},
+  ];
+  const cur=levels[level]||levels[2];
+  return(
+    <div style={{padding:"10px 14px",background:"rgba(0,0,0,0.4)",border:`1px solid ${cur.color}30`,borderRadius:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+        <span style={{color:"#4a6a7a",fontSize:9,letterSpacing:3,fontFamily:"'Share Tech Mono',monospace"}}>THREAT LEVEL</span>
+        <span style={{color:cur.color,fontSize:11,fontWeight:700,fontFamily:"'Share Tech Mono',monospace",textShadow:`0 0 8px ${cur.color}`}}>{cur.label}</span>
+      </div>
+      <div style={{height:4,background:"rgba(255,255,255,0.06)",borderRadius:2,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${cur.pct}%`,background:`linear-gradient(90deg,${cur.color}80,${cur.color})`,borderRadius:2,boxShadow:`0 0 8px ${cur.color}`,transition:"width 1s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+/* ── TICKER ─────────────────────────────────────────────────────── */
+const TICKERS=[
+  "CVE-2026-1042 · CRITICAL · VMware ESXi RCE",
+  "CISA AA26-045A · ICS Advisory · Siemens SIMATIC",
+  "T1190 Exploit Public-Facing App · Active Campaign",
+  "RANSOMWARE · BlackByte 3.0 · DC Targeting",
+  "MITRE ATT&CK T0862 · OT Active Discovery",
+  "CVE-2026-0987 · HIGH · Kubernetes API Server",
+  "CISA Alert · Energy Sector SCADA Targeting",
+  "APT41 · DC East-West Lateral Movement Detected",
+];
+function Ticker(){
+  const [idx,setIdx]=useState(0);
+  const [visible,setVisible]=useState(true);
+  useInterval(()=>{
+    setVisible(false);
+    setTimeout(()=>{ setIdx(i=>(i+1)%TICKERS.length); setVisible(true); },400);
+  },3500);
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:10,overflow:"hidden",flex:1}}>
+      <span style={{color:"#ff2d55",fontSize:9,fontFamily:"'Share Tech Mono',monospace",letterSpacing:2,flexShrink:0,animation:"blink 1s step-end infinite"}}>▶ LIVE</span>
+      <span style={{color:"#7ab8cc",fontSize:11,fontFamily:"'Share Tech Mono',monospace",opacity:visible?1:0,transition:"opacity 0.3s",whiteSpace:"nowrap"}}>{TICKERS[idx]}</span>
+    </div>
+  );
+}
+
+/* ── MESSAGE BUBBLE ─────────────────────────────────────────────── */
+function Bubble({msg}){
+  const isBot=msg.role==="assistant";
+  const lines=msg.content.split("\n");
+  return(
+    <div style={{display:"flex",gap:10,marginBottom:18,flexDirection:isBot?"row":"row-reverse",animation:"fadeUp .3s ease"}}>
+      {isBot&&(
+        <div style={{width:34,height:34,borderRadius:"50%",background:"linear-gradient(135deg,#00d4ff20,#bf5fff20)",border:"1px solid #00d4ff40",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0,boxShadow:"0 0 12px rgba(0,212,255,0.3)"}}>⚡</div>
+      )}
+      <div style={{maxWidth:"78%",minWidth:0}}>
+        {isBot&&<div style={{color:"#2a5a7a",fontSize:9,fontFamily:"'Share Tech Mono',monospace",marginBottom:4,letterSpacing:2}}>{msg.time} · DCOT INTEL</div>}
+        <div style={{
+          padding:"12px 16px",
+          background:isBot?"rgba(0,12,28,0.95)":"rgba(0,212,255,0.06)",
+          border:isBot?"1px solid rgba(0,212,255,0.15)":"1px solid rgba(0,212,255,0.25)",
+          borderRadius:isBot?"3px 12px 12px 12px":"12px 3px 12px 12px",
+          color:"#c8dfe8",fontSize:13,lineHeight:1.75,
+          fontFamily:isBot?"'Share Tech Mono',monospace":"'Syne',sans-serif",
+          boxShadow:isBot?"inset 0 1px 0 rgba(0,212,255,0.05),0 4px 20px rgba(0,0,0,0.4)":"none",
+          wordBreak:"break-word",whiteSpace:"pre-wrap",
+        }}>
+          {lines.map((l,i)=>{
+            if(l.startsWith("##")) return <div key={i} style={{color:"#00d4ff",fontWeight:700,fontSize:12,letterSpacing:2,margin:"12px 0 4px",borderBottom:"1px solid #00d4ff20",paddingBottom:4}}>{l.replace(/^#+\s/,"")}</div>;
+            if(l.startsWith("🔴")||l.startsWith("###")) return <div key={i} style={{color:"#ff4466",fontWeight:700,fontSize:12,margin:"10px 0 2px"}}>{l.replace(/^#+\s/,"")}</div>;
+            if(l.startsWith("🟠")) return <div key={i} style={{color:"#ff7744",fontWeight:700,fontSize:12,margin:"10px 0 2px"}}>{l}</div>;
+            if(l.startsWith("🟡")) return <div key={i} style={{color:"#ffcc44",fontWeight:700,fontSize:12,margin:"10px 0 2px"}}>{l}</div>;
+            if(l.startsWith("🟢")) return <div key={i} style={{color:"#44ff88",fontWeight:700,fontSize:12,margin:"10px 0 2px"}}>{l}</div>;
+            if(l.startsWith("**")&&l.endsWith("**")) return <div key={i} style={{color:"#80c8e0",fontWeight:700,margin:"6px 0 2px"}}>{l.replace(/\*\*/g,"")}</div>;
+            if(l.startsWith("-")||l.startsWith("•")) return <div key={i} style={{paddingLeft:12,color:"#8ab4c4",margin:"1px 0"}}><span style={{color:"#00d4ff",marginRight:6}}>›</span>{l.slice(1).trim()}</div>;
+            if(l.trim()==="") return <div key={i} style={{height:6}}/>;
+            return <div key={i}>{l}</div>;
+          })}
+        </div>
+        {isBot&&msg.sources&&(
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>
+            {msg.sources.map(s=>(
+              <span key={s} style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:"rgba(0,212,255,0.07)",border:"1px solid rgba(0,212,255,0.2)",color:"#4a8a9a",fontFamily:"'Share Tech Mono',monospace",letterSpacing:1}}>{s}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── TYPING ─────────────────────────────────────────────────────── */
+function Typing(){
+  return(
+    <div style={{display:"flex",gap:10,marginBottom:18}}>
+      <div style={{width:34,height:34,borderRadius:"50%",background:"linear-gradient(135deg,#00d4ff20,#bf5fff20)",border:"1px solid #00d4ff40",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>⚡</div>
+      <div style={{padding:"14px 18px",background:"rgba(0,12,28,0.95)",border:"1px solid rgba(0,212,255,0.15)",borderRadius:"3px 12px 12px 12px",display:"flex",alignItems:"center",gap:8}}>
+        {[0,1,2].map(i=>(
+          <div key={i} style={{width:6,height:6,borderRadius:"50%",background:"#00d4ff",animation:"pulse 1.2s ease-in-out infinite",animationDelay:`${i*.2}s`}}/>
+        ))}
+        <span style={{color:"#2a6a8a",fontSize:10,fontFamily:"'Share Tech Mono',monospace",marginLeft:4}}>ANALYZING THREAT INTEL...</span>
+      </div>
+    </div>
+  );
+}
+
+/* ── MAIN ───────────────────────────────────────────────────────── */
+export default function DCOTBot(){
+  const [msgs,setMsgs]=useState([{
+    role:"assistant",time:ts(),
+    content:`DCOT Bot online. System nominal.\n\n🖥️ Data Center + ⚙️ OT/ICS coverage active.\n\nIntel sources locked:\n• CISA Advisory & Alerts\n• MITRE ATT&CK & ATLAS\n• Feedly · Hacker News · Dark Reading\n\nAll sources running live web search. Query at will.`,
+    sources:["SYSTEM"]
+  }]);
+  const [input,setInput]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [activeSrc,setActiveSrc]=useState(SOURCES.map(s=>s.id));
+  const [focus,setFocus]=useState("both");
+  const [threatLevel,setThreatLevel]=useState(2);
+  const [time,setTime]=useState(ts());
+  const bottomRef=useRef();
+  const taRef=useRef();
+
+  useInterval(()=>setTime(ts()),1000);
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[msgs,loading]);
+
+  const toggleSrc=id=>setActiveSrc(p=>p.includes(id)?p.filter(x=>x!==id):[...p,id]);
+
+  const send=useCallback(async(qOverride)=>{
+    const text=(qOverride||input).trim();
+    if(!text||loading) return;
+    setInput("");
+    const focusLabel=FOCUS.find(f=>f.id===focus)?.label;
+    const srcLabels=SOURCES.filter(s=>activeSrc.includes(s.id)).map(s=>s.label);
+    const enriched=`${text}\n\n[Focus: ${focusLabel}]\n[Sources: ${srcLabels.join(", ")}]`;
+    const userMsg={role:"user",time:ts(),content:text};
+    const history=[...msgs,userMsg];
+    setMsgs(history);
+    setLoading(true);
+    setThreatLevel(Math.floor(Math.random()*4));
+    try{
+      const apiMsgs=history.map(m=>({role:m.role,content:m.content}));
+      apiMsgs[apiMsgs.length-1].content=enriched;
+      const res=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          model:"claude-sonnet-4-20250514",
+          max_tokens:1000,
+          system:SYSTEM_PROMPT,
+          tools:[{type:"web_search_20250305",name:"web_search"}],
+          messages:apiMsgs,
+        }),
+      });
+      const data=await res.json();
+      const full=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
+      setMsgs(p=>[...p,{role:"assistant",time:ts(),content:full||"No intelligence retrieved.",sources:srcLabels}]);
+    }catch(e){
+      setMsgs(p=>[...p,{role:"assistant",time:ts(),content:`⚠️ Connection error: ${e.message}`,sources:[]}]);
+    }finally{ setLoading(false); }
+  },[msgs,input,loading,focus,activeSrc]);
+
+  const onKey=e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();} };
+
+  return(
+    <>
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Syne:wght@400;600;700;800&display=swap');
+      *{box-sizing:border-box;margin:0;padding:0;}
+      body{background:#020c18;}
+      @keyframes pulse{0%,100%{opacity:.3;transform:scale(1)}50%{opacity:1;transform:scale(1.4)}}
+      @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+      @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+      @keyframes scanH{0%{transform:translateY(-100%)}100%{transform:translateY(100vh)}}
+      @keyframes spin{to{transform:rotate(360deg)}}
+      @keyframes glitch{0%,100%{clip-path:inset(0)}33%{clip-path:inset(10% 0 80% 0);transform:translate(-2px)}66%{clip-path:inset(70% 0 5% 0);transform:translate(2px)}}
+      ::-webkit-scrollbar{width:3px;}
+      ::-webkit-scrollbar-track{background:#020c18;}
+      ::-webkit-scrollbar-thumb{background:#00d4ff25;border-radius:2px;}
+      textarea:focus{outline:none;}
+      textarea{resize:none;}
+      button{cursor:pointer;}
+    `}</style>
+
+    {/* SCANLINE */}
+    <div style={{position:"fixed",top:0,left:0,right:0,height:3,background:"linear-gradient(transparent,rgba(0,212,255,0.04),transparent)",animation:"scanH 10s linear infinite",pointerEvents:"none",zIndex:9999}}/>
+
+    {/* HEX GRID BG */}
+    <div style={{position:"fixed",inset:0,backgroundImage:`url("data:image/svg+xml,%3Csvg width='60' height='52' viewBox='0 0 60 52' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M30 2 L58 17 L58 35 L30 50 L2 35 L2 17Z' fill='none' stroke='%2300d4ff' stroke-width='0.3' opacity='0.06'/%3E%3C/svg%3E")`,backgroundSize:"60px 52px",pointerEvents:"none",zIndex:0}}/>
+
+    <div style={{display:"flex",height:"100vh",position:"relative",zIndex:1,overflow:"hidden"}}>
+
+      {/* ── LEFT PANEL ─────────────────────────────────────────── */}
+      <div style={{width:220,background:"rgba(0,6,16,0.97)",borderRight:"1px solid rgba(0,212,255,0.1)",display:"flex",flexDirection:"column",flexShrink:0}}>
+
+        {/* Logo */}
+        <div style={{padding:"18px 16px 14px",borderBottom:"1px solid rgba(0,212,255,0.08)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <div style={{width:40,height:40,borderRadius:8,background:"rgba(0,212,255,0.08)",border:"1px solid rgba(0,212,255,0.3)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,boxShadow:"0 0 16px rgba(0,212,255,0.2)"}}>⚡</div>
+            <div>
+              <div style={{color:"#00d4ff",fontFamily:"'Share Tech Mono',monospace",fontSize:20,fontWeight:700,letterSpacing:3,textShadow:"0 0 16px rgba(0,212,255,0.6)"}}>DCOT</div>
+              <div style={{color:"#1a4a5a",fontSize:8,fontFamily:"'Share Tech Mono',monospace",letterSpacing:3}}>THREAT INTEL</div>
+            </div>
+          </div>
+          <MatrixStrip/>
+        </div>
+
+        {/* Clock + Radar */}
+        <div style={{padding:"14px 16px",borderBottom:"1px solid rgba(0,212,255,0.08)",display:"flex",flexDirection:"column",alignItems:"center",gap:10}}>
+          <div style={{color:"#00d4ff",fontFamily:"'Share Tech Mono',monospace",fontSize:22,letterSpacing:4,textShadow:"0 0 12px rgba(0,212,255,0.5)"}}>{time}</div>
+          <Radar/>
+          <ThreatMeter level={threatLevel}/>
+        </div>
+
+        {/* Focus */}
+        <div style={{padding:"12px 14px 8px",borderBottom:"1px solid rgba(0,212,255,0.06)"}}>
+          <div style={{color:"#1a4a5a",fontSize:8,fontFamily:"'Share Tech Mono',monospace",letterSpacing:3,marginBottom:8}}>FOCUS AREA</div>
+          {FOCUS.map(f=>(
+            <button key={f.id} onClick={()=>setFocus(f.id)} style={{
+              width:"100%",padding:"7px 10px",marginBottom:3,
+              background:focus===f.id?"rgba(0,212,255,0.1)":"transparent",
+              border:focus===f.id?"1px solid rgba(0,212,255,0.35)":"1px solid rgba(255,255,255,0.04)",
+              borderRadius:6,color:focus===f.id?"#00d4ff":"#2a5a6a",
+              fontSize:11,fontFamily:"'Share Tech Mono',monospace",
+              display:"flex",alignItems:"center",gap:8,letterSpacing:1,
+              transition:"all .15s",
+              boxShadow:focus===f.id?"0 0 10px rgba(0,212,255,0.1)":"none"
+            }}>
+              <span>{f.icon}</span>{f.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Sources */}
+        <div style={{padding:"12px 14px",flex:1,overflowY:"auto"}}>
+          <div style={{color:"#1a4a5a",fontSize:8,fontFamily:"'Share Tech Mono',monospace",letterSpacing:3,marginBottom:8}}>INTEL SOURCES</div>
+          {SOURCES.map(s=>{
+            const on=activeSrc.includes(s.id);
+            return(
+              <div key={s.id} onClick={()=>toggleSrc(s.id)} style={{
+                display:"flex",alignItems:"center",gap:8,padding:"6px 8px",marginBottom:2,
+                borderRadius:6,cursor:"pointer",
+                background:on?`${s.color}0d`:"transparent",
+                border:`1px solid ${on?s.color+"30":"rgba(255,255,255,0.03)"}`,
+                transition:"all .15s"
+              }}>
+                <div style={{width:7,height:7,borderRadius:"50%",background:on?s.color:"#1a2a3a",boxShadow:on?`0 0 6px ${s.color}`:"none",flexShrink:0,transition:"all .2s"}}/>
+                <span style={{fontSize:11,color:on?"#a0c8d8":"#2a4a5a",fontFamily:"'Share Tech Mono',monospace"}}>{s.icon} {s.label}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Status bar */}
+        <div style={{padding:"10px 14px",borderTop:"1px solid rgba(0,212,255,0.06)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:6,height:6,borderRadius:"50%",background:"#00ff88",boxShadow:"0 0 8px #00ff88",animation:"pulse 2s infinite"}}/>
+            <span style={{color:"#1a6a4a",fontSize:9,fontFamily:"'Share Tech Mono',monospace",letterSpacing:2}}>LIVE · {activeSrc.length}/{SOURCES.length} ACTIVE</span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── CENTER MAIN ────────────────────────────────────────── */}
+      <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0}}>
+
+        {/* Top bar */}
+        <div style={{padding:"10px 20px",borderBottom:"1px solid rgba(0,212,255,0.08)",background:"rgba(0,4,12,0.9)",backdropFilter:"blur(20px)",display:"flex",alignItems:"center",gap:16,flexShrink:0}}>
+          <div style={{flex:1}}>
+            <div style={{color:"#60a0b4",fontSize:11,fontFamily:"'Share Tech Mono',monospace",letterSpacing:2,marginBottom:2}}>DATA CENTER & OPERATIONAL TECHNOLOGY</div>
+            <div style={{color:"#1a4a5a",fontSize:9,fontFamily:"'Share Tech Mono',monospace",letterSpacing:3}}>SECURITY INTELLIGENCE OPERATIONS CENTER</div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            {["DC","OT","API"].map((l,i)=>(
+              <div key={l} style={{padding:"4px 10px",background:"rgba(0,212,255,0.06)",border:"1px solid rgba(0,212,255,0.15)",borderRadius:4,color:"#2a7a8a",fontSize:9,fontFamily:"'Share Tech Mono',monospace",letterSpacing:2}}>
+                <span style={{color:"#00ff88",marginRight:4}}>●</span>{l}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Ticker */}
+        <div style={{padding:"6px 20px",background:"rgba(0,212,255,0.03)",borderBottom:"1px solid rgba(0,212,255,0.06)",display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+          <span style={{color:"#1a4a5a",fontSize:9,fontFamily:"'Share Tech Mono',monospace",letterSpacing:3,flexShrink:0}}>INTEL FEED</span>
+          <div style={{width:1,height:12,background:"rgba(0,212,255,0.15)"}}/>
+          <Ticker/>
+        </div>
+
+        {/* Messages */}
+        <div style={{flex:1,overflowY:"auto",padding:"20px 24px 8px"}}>
+          {msgs.map((m,i)=><Bubble key={i} msg={m}/>)}
+          {loading&&<Typing/>}
+          <div ref={bottomRef}/>
+        </div>
+
+        {/* Quick Intel */}
+        <div style={{padding:"8px 24px 4px",flexShrink:0}}>
+          <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:4}}>
+            {QUICK.map((q,i)=>(
+              <button key={i} onClick={()=>send(q.q)} disabled={loading} style={{
+                whiteSpace:"nowrap",padding:"5px 12px",
+                background:"rgba(0,0,0,0.4)",
+                border:"1px solid rgba(0,212,255,0.15)",
+                borderRadius:20,color:"#3a7a8a",fontSize:10,
+                fontFamily:"'Share Tech Mono',monospace",letterSpacing:1,
+                opacity:loading?.5:1,transition:"all .15s",
+                cursor:loading?"not-allowed":"pointer"
+              }}
+              onMouseEnter={e=>{if(!loading){e.target.style.background="rgba(0,212,255,0.08)";e.target.style.color="#00d4ff";e.target.style.borderColor="rgba(0,212,255,0.35)";}}}
+              onMouseLeave={e=>{e.target.style.background="rgba(0,0,0,0.4)";e.target.style.color="#3a7a8a";e.target.style.borderColor="rgba(0,212,255,0.15)";}}
+              >{q.label}</button>
+            ))}
+          </div>
+        </div>
+
+        {/* Input */}
+        <div style={{padding:"8px 24px 20px",flexShrink:0}}>
+          <div style={{
+            display:"flex",gap:12,alignItems:"flex-end",
+            background:"rgba(0,6,18,0.95)",
+            border:"1px solid rgba(0,212,255,0.2)",
+            borderRadius:10,padding:"10px 14px",
+            boxShadow:"0 0 30px rgba(0,212,255,0.05),inset 0 1px 0 rgba(0,212,255,0.04)"
+          }}>
+            <span style={{color:"#00d4ff",fontFamily:"'Share Tech Mono',monospace",fontSize:13,marginBottom:2,flexShrink:0}}>›_</span>
+            <textarea
+              ref={taRef} value={input}
+              onChange={e=>setInput(e.target.value)}
+              onKeyDown={onKey}
+              placeholder="Query threat intelligence... CVEs, advisories, TTPs, threat actors, ICS vulnerabilities"
+              rows={2} disabled={loading}
+              style={{flex:1,background:"transparent",border:"none",color:"#a0c8d8",fontSize:13,lineHeight:1.6,fontFamily:"'Share Tech Mono',monospace"}}
+            />
+            <button onClick={()=>send()} disabled={loading||!input.trim()} style={{
+              width:38,height:38,borderRadius:8,flexShrink:0,
+              background:loading||!input.trim()?"rgba(0,212,255,0.05)":"rgba(0,212,255,0.12)",
+              border:`1px solid ${loading||!input.trim()?"rgba(0,212,255,0.1)":"rgba(0,212,255,0.4)"}`,
+              color:loading||!input.trim()?"#1a4a5a":"#00d4ff",fontSize:16,
+              display:"flex",alignItems:"center",justifyContent:"center",
+              transition:"all .2s",
+              boxShadow:!loading&&input.trim()?"0 0 14px rgba(0,212,255,0.25)":"none"
+            }}>
+              {loading?"⏳":"⚡"}
+            </button>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",marginTop:6,padding:"0 2px"}}>
+            <span style={{color:"#0a2a3a",fontSize:9,fontFamily:"'Share Tech Mono',monospace"}}>ENTER TO SEND · SHIFT+ENTER FOR NEWLINE</span>
+            <span style={{color:"#0a2a3a",fontSize:9,fontFamily:"'Share Tech Mono',monospace"}}>LIVE WEB SEARCH · ALL SOURCES</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    </>
+  );
+}
